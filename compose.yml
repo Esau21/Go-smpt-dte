@@ -1,0 +1,45 @@
+services:
+  # PostgreSQL
+  postgres:
+    image: postgres:17
+    container_name: postgres-db
+    ports:
+      - 5435:5434 
+    restart: always
+    environment:
+      - POSTGRES_DB=${DB_NAME} 
+      - POSTGRES_USER=${DB_USER} 
+      - POSTGRES_PASSWORD=${DB_PASS} 
+    networks:
+      - api-postgres
+    volumes:
+      - postgres_local_data:/var/lib/postgresql/data:Z 
+
+  # Go API
+  smpt-dte:
+    container_name: smpt-dte
+    build: 
+      context: ./
+      dockerfile: Dockerfile
+    environment:
+      - DB_STRING=${DB_STRING}
+      - DB_CONTEXT=${DB_CONTEXT}
+      - TRACE_TYPE=${TRACE_TYPE}
+      - SERVICE_NAME=${SERVICE_NAME}
+      - OAUTH_CLIENT_ID=${OAUTH_CLIENT_ID}
+      - OAUTH_CLIENT_SECRET=${OAUTH_CLIENT_SECRET}
+      - PUBLIC_ORIGIN=${PUBLIC_ORIGIN}
+      - AFTER_LOGIN_PATH=${AFTER_LOGIN_PATH}
+      - MAIL_PROVIDER=${MAIL_PROVIDER}
+    restart: always
+    ports:
+      - 8080:8080
+    networks:
+      - api-postgres
+  
+networks:
+  api-postgres:
+    driver: bridge
+
+volumes:
+  postgres_local_data: {}
