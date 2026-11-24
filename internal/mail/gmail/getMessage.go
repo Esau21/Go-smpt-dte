@@ -43,7 +43,31 @@ func getMessage(c *gin.Context, s session) {
 	result := fields(m, mail.GetHeader)
 	result["to"] = mail.GetHeader("To")
 	result["text"] = mail.Text
+	result["html"] = inlineImages(mail)
+	result["attachments"] = fileList(mail)
 	c.JSON(200, result)
+}
+
+// inlineImages devuelve el HTML del correo con las imágenes incrustadas
+// (logos y firmas referenciados como "cid:...") convertidas a data URI,
+// para que el navegador pueda mostrarlas sin pedir nada más al servidor.
+func inlineImages(mail *enmime.Envelope) string {
+	html := mail.HTML
+	if !strings.Contains(html, "cid:") {
+		return html
+	}
+
+	for _, parts := range [][]*enmime.Part{mail.Inlines, mail.OtherParts, mail.Attachments} {
+		for _, p := range parts {
+			kind := imageType(p)
+			if p.ContentID == "" || kind == "" {
+				continue
+			}
+			src := "data:" + kind + ";base64," + base64.StdEncoding.EncodeToString(p.Content)
+			html = strings.ReplaceAll(html, "cid:"+p.ContentID, src)
+		}
+	}
+	return html
 }
 
 /**

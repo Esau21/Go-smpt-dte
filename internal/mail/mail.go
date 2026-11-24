@@ -17,6 +17,7 @@ type IMail interface {
 	ListMessages(c *gin.Context)
 	GetMessage(c *gin.Context)
 	GetDTE(c *gin.Context)
+	GetAttachment(c *gin.Context)
 }
 
 func NewMail(origin, afterlogin string) (IMail, error) {
