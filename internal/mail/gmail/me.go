@@ -20,5 +20,5 @@ func (*GmailClient) Me(c *gin.Context) {
 }
 
 func me(c *gin.Context, s session) {
-	c.JSON(200, gin.H{"id": s.sub, "email": s.email})
+	c.JSON(200, gin.H{"id": s.sub, "email": s.email, "provider": "gmail"})
 }

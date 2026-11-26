@@ -13,7 +13,7 @@ import (
 type Routes struct {
 	Routes *gin.Engine
 	Mail   mail.IMail
-	// Invoices son las facturas guardadas en la base de datos.
+	// Invoices son las facturas y los archivos guardados en el bucket.
 	Invoices *invoices.Handlers
 }
 

@@ -7,7 +7,6 @@ import (
 	"github.com/Esau21/Go-smpt-dte/internal/bucket"
 	"github.com/Esau21/Go-smpt-dte/internal/invoices"
 	"github.com/Esau21/Go-smpt-dte/internal/mail"
-	"github.com/Esau21/Go-smpt-dte/internal/store"
 	"github.com/Esau21/Go-smpt-dte/internal/router"
 	"github.com/Esau21/Go-smpt-dte/internal/validations"
 )
@@ -33,29 +32,20 @@ func runApp(ctx context.Context) error {
 		return err
 	}
 
-	// La base de datos guarda las facturas. Si no está disponible, la API
-	// arranca igual: el correo funciona y las rutas de facturas responden 503.
-	var db *store.Store
-	if dsn, err := validations.RequiredEnv("DB_STRING"); err != nil {
-		log.Println("Warning: DB_STRING no configurado; las facturas quedan deshabilitadas")
-	} else if db, err = store.Open(ctx, dsn); err != nil {
-		log.Println("Warning: base de datos no disponible; las facturas quedan deshabilitadas:", err)
-		db = nil
+	// Todo lo que la app guarda (facturas, notas y archivos) vive en un
+	// bucket. Si no está disponible, la API arranca igual: el correo
+	// funciona y las rutas de facturas y archivos responden 503.
+	var files invoices.Files
+	if name, err := validations.RequiredEnv("FILES_BUCKET"); err != nil {
+		log.Println("Warning: FILES_BUCKET no configurado; facturas y archivos quedan deshabilitados")
+	} else if opened, err := bucket.Open(ctx, name); err != nil {
+		log.Println("Warning: bucket no disponible; facturas y archivos quedan deshabilitados:", err)
+	} else {
+		files = opened
 	}
 
 	r.Mail = mail
-	handlers := &invoices.Handlers{Store: db, Mail: mail}
-
-	// El bucket guarda los archivos que el usuario manda "a la nube". Sin
-	// bucket, esos archivos quedan en la base de datos.
-	if name, err := validations.RequiredEnv("FILES_BUCKET"); err != nil {
-		log.Println("Warning: FILES_BUCKET no configurado; los archivos se guardan en la base de datos")
-	} else if files, err := bucket.Open(ctx, name); err != nil {
-		log.Println("Warning: bucket no disponible; los archivos se guardan en la base de datos:", err)
-	} else {
-		handlers.Bucket = files
-	}
-	r.Invoices = handlers
+	r.Invoices = invoices.New(files, mail)
 	r.Routes = r.SetupRouter()
 
 	r.Run()

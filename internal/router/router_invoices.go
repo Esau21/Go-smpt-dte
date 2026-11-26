@@ -9,6 +9,7 @@ func (ro *Routes) InvoiceRoutes(r *gin.Engine) {
 		routes.GET("", ro.Mail.WithSession(ro.Invoices.List))
 		routes.GET("/summary", ro.Mail.WithSession(ro.Invoices.Summary))
 		routes.GET("/export", ro.Mail.WithSession(ro.Invoices.Export))
+		routes.PATCH("", ro.Mail.WithSession(ro.Invoices.UpdateMany))
 		routes.PATCH("/:id", ro.Mail.WithSession(ro.Invoices.Update))
 	}
 
@@ -18,6 +19,14 @@ func (ro *Routes) InvoiceRoutes(r *gin.Engine) {
 		files.POST("", ro.Mail.WithSession(ro.Invoices.SaveFile))
 		files.GET("", ro.Mail.WithSession(ro.Invoices.ListFiles))
 		files.GET("/:id", ro.Mail.WithSession(ro.Invoices.DownloadFile))
+		files.PATCH("/:id", ro.Mail.WithSession(ro.Invoices.MoveFile))
 		files.DELETE("/:id", ro.Mail.WithSession(ro.Invoices.DeleteFile))
+	}
+
+	// Carpetas creadas a mano por el usuario.
+	folders := r.Group("/api/v1/folders")
+	{
+		folders.POST("", ro.Mail.WithSession(ro.Invoices.CreateFolder))
+		folders.DELETE("", ro.Mail.WithSession(ro.Invoices.DeleteFolder))
 	}
 }

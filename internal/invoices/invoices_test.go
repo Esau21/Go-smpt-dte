@@ -2,8 +2,6 @@ package invoices
 
 import (
 	"bytes"
-	"context"
-	"os"
 	"strings"
 	"testing"
 
@@ -182,79 +180,5 @@ func TestDetailBook(t *testing.T) {
 	// Un libro sin facturas también debe generarse.
 	if _, err := detailBook(nil, ""); err != nil {
 		t.Errorf("libro vacío: %v", err)
-	}
-}
-
-// TestStore prueba el almacenamiento contra un Postgres real. Se omite si
-// no se indica la conexión: TEST_DB_STRING="host=localhost port=5435 ..."
-func TestStore(t *testing.T) {
-	dsn := os.Getenv("TEST_DB_STRING")
-	if dsn == "" {
-		t.Skip("TEST_DB_STRING no definido")
-	}
-	ctx := context.Background()
-	s, err := store.Open(ctx, dsn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
-
-	const owner = "test:store"
-	t.Cleanup(func() { _ = s.DeleteOwner(ctx, owner) })
-	_ = s.DeleteOwner(ctx, owner)
-
-	for _, invoice := range sample() {
-		isNew, err := s.Upsert(ctx, owner, invoice)
-		if err != nil || !isNew {
-			t.Fatalf("upsert: nuevo=%v err=%v", isNew, err)
-		}
-	}
-	if isNew, _ := s.Upsert(ctx, owner, sample()[0]); isNew {
-		t.Error("repetir un DTE no debe contarse como nuevo")
-	}
-
-	items, totals, err := s.List(ctx, owner, store.Filter{Limit: 2})
-	if err != nil {
-		t.Fatal(err)
-	}
-	// 114 + 11.30 - 11.30 (la nota de crédito resta)
-	if len(items) != 2 || totals.Count != 3 || totals.Total != 114 {
-		t.Errorf("lista: %d filas, totales %+v", len(items), totals)
-	}
-
-	status, notes := "pagada", "Pagada por transferencia"
-	updated, err := s.Update(ctx, owner, items[0].ID, store.Patch{Status: &status, Notes: &notes})
-	if err != nil || updated.Status != status || updated.Notes != notes {
-		t.Errorf("update: %+v %v", updated, err)
-	}
-	// Volver a sincronizar el mismo DTE conserva lo que anotó el usuario.
-	if _, err := s.Upsert(ctx, owner, items[0]); err != nil {
-		t.Fatal(err)
-	}
-	if again, _, _ := s.List(ctx, owner, store.Filter{Status: "pagada"}); len(again) != 1 || again[0].Notes != notes {
-		t.Errorf("el estado y las notas deben conservarse: %+v", again)
-	}
-	if _, err := s.Update(ctx, "test:otro", items[0].ID, store.Patch{Status: &status}); err != store.ErrNotFound {
-		t.Errorf("otra cuenta no debe poder modificar la factura: %v", err)
-	}
-
-	if found, _, _ := s.List(ctx, owner, store.Filter{Search: "proveedor", Tipo: "03", From: "2026-11-01", To: "2026-11-30"}); len(found) != 1 {
-		t.Errorf("filtros: %d", len(found))
-	}
-
-	summary, err := s.Summary(ctx, owner, "2026-01-01")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(summary.Months) != 1 || summary.Months[0].Month != "2026-11" || summary.Months[0].Total != 114 ||
-		len(summary.Issuers) != 1 || summary.ByStatus["pagada"] != 1 {
-		t.Errorf("resumen: %+v", summary)
-	}
-
-	if err := s.MarkScanned(ctx, owner, "m1"); err != nil {
-		t.Fatal(err)
-	}
-	if known, _ := s.Known(ctx, owner, []string{"m1", "m2"}); !known["m1"] || known["m2"] {
-		t.Errorf("correos revisados: %v", known)
 	}
 }

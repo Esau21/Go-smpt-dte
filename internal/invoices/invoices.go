@@ -1,15 +1,17 @@
 // Package invoices expone las facturas guardadas: sincronizarlas desde el
-// correo, listarlas, resumirlas, anotarlas y exportarlas a Excel.
+// correo, listarlas, resumirlas, anotarlas y exportarlas a Excel. También
+// los archivos que el usuario guarda en la nube.
 package invoices
 
 import (
 	"context"
+	"log"
 	"net/http"
 	"regexp"
 	"slices"
 	"strconv"
 	"strings"
-	"sync/atomic"
+	"sync"
 	"time"
 
 	"github.com/Esau21/Go-smpt-dte/internal/dte"
@@ -29,7 +31,7 @@ type Mailbox interface {
 	ErrorStatus(err error) int
 }
 
-// Files es el almacenamiento de archivos (un bucket).
+// Files es el bucket donde vive todo: los archivos y los datos de cada cuenta.
 type Files interface {
 	Name() string
 	Put(ctx context.Context, key string, content []byte, contentType string) error
@@ -38,25 +40,41 @@ type Files interface {
 }
 
 type Handlers struct {
-	Store *store.Store // nil si la base de datos no está configurada
-	// Bucket es donde se guardan los archivos de "la nube"; nil si no hay
-	// bucket configurado (entonces quedan en la base de datos).
+	// Bucket y Store son nil si el bucket no está disponible; entonces
+	// estas rutas responden 503 y el resto de la API sigue funcionando.
 	Bucket Files
-	Mail  Mailbox
+	Store  *store.Store
+	Mail   Mailbox
 }
 
-// syncPage es cuántos correos se revisan por llamada a /sync.
-const syncPage = 20
+// New arma los manejadores sobre un bucket (nil si no hay ninguno disponible).
+func New(files Files, mail Mailbox) *Handlers {
+	h := &Handlers{Mail: mail}
+	if files != nil {
+		h.Bucket = files
+		h.Store = store.New(files)
+	}
+	return h
+}
+
+// syncPage es cuántos correos se revisan por llamada a /sync, y
+// syncWorkers cuántos se piden a la vez. De cada correo solo se baja el
+// .json (unos KB), así que una página entera tarda pocos segundos.
+const (
+	syncPage    = 50
+	syncWorkers = 8
+)
 
 // elSalvador es la zona horaria del país (UTC-6, sin horario de verano).
 var elSalvador = time.FixedZone("CST", -6*60*60)
 
 var dateRE = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}$`)
 
-// owner devuelve la cuenta con sesión, o responde el error y devuelve false.
+// owner devuelve la carpeta de la cuenta con sesión (su correo), o responde
+// el error y devuelve false.
 func (h *Handlers) owner(c *gin.Context) (string, bool) {
 	if h.Store == nil {
-		validations.Fail(c, http.StatusServiceUnavailable, "database_unavailable")
+		validations.Fail(c, http.StatusServiceUnavailable, "storage_unavailable")
 		return "", false
 	}
 	account, ok := h.Mail.Account(c)
@@ -64,7 +82,17 @@ func (h *Handlers) owner(c *gin.Context) (string, bool) {
 		validations.Fail(c, http.StatusUnauthorized, "login_required")
 		return "", false
 	}
-	return account.Owner(), true
+	return account.Email, true
+}
+
+// storageFailed responde un error del bucket y lo deja en el registro.
+func storageFailed(c *gin.Context, err error) {
+	log.Println("Error: fallo del bucket:", err)
+	validations.Fail(c, http.StatusBadGateway, "storage_error")
+}
+
+func storageWarn(message string, err error) {
+	log.Println("Warning:", message, err)
 }
 
 // Sync revisa una página de correos con .json adjunto y guarda los DTE
@@ -86,13 +114,18 @@ func (h *Handlers) Sync(c *gin.Context) {
 
 	known, err := h.Store.Known(ctx, owner, ids)
 	if err != nil {
-		validations.Fail(c, 500, "database_error")
+		storageFailed(c, err)
 		return
 	}
 
-	var imported, skipped atomic.Int32
+	var (
+		mu      sync.Mutex
+		found   []store.Invoice
+		scanned []string
+		skipped int
+	)
 	group, _ := errgroup.WithContext(ctx)
-	group.SetLimit(4)
+	group.SetLimit(syncWorkers)
 
 	for _, id := range ids {
 		if known[id] {
@@ -108,18 +141,16 @@ func (h *Handlers) Sync(c *gin.Context) {
 				return err
 			}
 
-			if invoice, ok := toInvoice(message); ok {
-				isNew, err := h.Store.Upsert(ctx, owner, invoice)
-				if err != nil {
-					return err
-				}
-				if isNew {
-					imported.Add(1)
-				}
+			invoice, isDTE := toInvoice(message)
+			mu.Lock()
+			defer mu.Unlock()
+			if isDTE {
+				found = append(found, invoice)
 			} else {
-				skipped.Add(1)
+				skipped++
 			}
-			return h.Store.MarkScanned(ctx, owner, id)
+			scanned = append(scanned, id)
+			return nil
 		})
 	}
 
@@ -129,6 +160,15 @@ func (h *Handlers) Sync(c *gin.Context) {
 		return
 	}
 
+	// Toda la página se guarda de una vez.
+	imported := 0
+	if len(scanned) > 0 {
+		if imported, err = h.Store.SaveSync(ctx, owner, found, scanned); err != nil {
+			storageFailed(c, err)
+			return
+		}
+	}
+
 	// Los correos vienen del más reciente al más antiguo: si toda la página
 	// ya estaba revisada, lo que sigue también lo está (salvo que se pida todo).
 	allKnown := len(ids) > 0 && len(known) == len(ids)
@@ -136,8 +176,8 @@ func (h *Handlers) Sync(c *gin.Context) {
 
 	c.JSON(200, gin.H{
 		"scanned":       len(ids),
-		"imported":      imported.Load(),
-		"skipped":       skipped.Load(),
+		"imported":      imported,
+		"skipped":       skipped,
 		"nextPageToken": next,
 		"done":          done,
 	})
@@ -192,6 +232,7 @@ func toInvoice(m *mailbox.Message) (store.Invoice, bool) {
 		MessageID:        m.ID,
 		MailFrom:         m.From,
 		MailSubject:      m.Subject,
+		Status:           "pendiente",
 	}, true
 }
 
@@ -204,6 +245,11 @@ func filter(c *gin.Context) (store.Filter, bool) {
 		Status: c.Query("status"),
 		Tipo:   c.Query("tipo"),
 		Search: strings.TrimSpace(c.Query("q")),
+		Sort:   c.Query("sort"),
+	}
+	if !slices.Contains(store.Sorts, f.Sort) {
+		validations.Fail(c, 400, "invalid_sort")
+		return f, false
 	}
 	for _, date := range []string{f.From, f.To} {
 		if date != "" && !dateRE.MatchString(date) {
@@ -242,10 +288,42 @@ func (h *Handlers) List(c *gin.Context) {
 
 	items, totals, err := h.Store.List(c.Request.Context(), owner, f)
 	if err != nil {
-		validations.Fail(c, 500, "database_error")
+		storageFailed(c, err)
 		return
 	}
-	c.JSON(200, gin.H{"items": items, "totals": totals})
+	byStatus, err := h.Store.StatusCounts(c.Request.Context(), owner, f)
+	if err != nil {
+		storageFailed(c, err)
+		return
+	}
+	c.JSON(200, gin.H{"items": items, "totals": totals, "byStatus": byStatus})
+}
+
+// UpdateMany cambia el estado de varias facturas a la vez.
+func (h *Handlers) UpdateMany(c *gin.Context) {
+	owner, ok := h.owner(c)
+	if !ok {
+		return
+	}
+	var body struct {
+		IDs    []int64 `json:"ids"`
+		Status string  `json:"status"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil || len(body.IDs) == 0 || len(body.IDs) > 5000 {
+		validations.Fail(c, 400, "invalid_body")
+		return
+	}
+	if !slices.Contains(store.Statuses, body.Status) {
+		validations.Fail(c, 400, "invalid_status")
+		return
+	}
+
+	updated, err := h.Store.UpdateMany(c.Request.Context(), owner, body.IDs, body.Status)
+	if err != nil {
+		storageFailed(c, err)
+		return
+	}
+	c.JSON(200, gin.H{"updated": updated})
 }
 
 // Summary resume los últimos 12 meses (incluido el actual).
@@ -260,7 +338,7 @@ func (h *Handlers) Summary(c *gin.Context) {
 
 	summary, err := h.Store.Summary(c.Request.Context(), owner, since.Format("2006-01-02"))
 	if err != nil {
-		validations.Fail(c, 500, "database_error")
+		storageFailed(c, err)
 		return
 	}
 	c.JSON(200, gin.H{
@@ -268,8 +346,12 @@ func (h *Handlers) Summary(c *gin.Context) {
 		"thisMonth":  now.Format("2006-01"),
 		"months":     summary.Months,
 		"issuers":    summary.Issuers,
-		"byStatus":   summary.ByStatus,
-		"categories": summary.Categories,
+		"byStatus":       summary.ByStatus,
+		"categories":     summary.Categories,
+		"recent":         summary.Recent,
+		"types":          summary.Types,
+		"categoryTotals": summary.CategoryTotals,
+		"pending":        summary.Pending,
 	})
 }
 
@@ -312,7 +394,7 @@ func (h *Handlers) Update(c *gin.Context) {
 		return
 	}
 	if err != nil {
-		validations.Fail(c, 500, "database_error")
+		storageFailed(c, err)
 		return
 	}
 	c.JSON(200, invoice)
@@ -332,7 +414,7 @@ func (h *Handlers) Export(c *gin.Context) {
 
 	items, _, err := h.Store.List(c.Request.Context(), owner, f)
 	if err != nil {
-		validations.Fail(c, 500, "database_error")
+		storageFailed(c, err)
 		return
 	}
 	// Los libros se llevan en orden cronológico.

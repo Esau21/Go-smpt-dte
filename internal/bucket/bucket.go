@@ -114,6 +114,18 @@ func Key(account, fecha, emisor, filename string) string {
 	return strings.Join(append(parts, segment(filename)), "/")
 }
 
+// DataKey es la ruta del documento con los datos de una cuenta (facturas,
+// notas y registro de archivos). Va en una carpeta aparte, fuera de las
+// carpetas por año que ve el usuario.
+func DataKey(account string) string {
+	return segment(account) + "/_bookeep/datos.json.gz"
+}
+
+// LegacyDataKey es donde se guardaba ese documento antes de comprimirlo.
+func LegacyDataKey(account string) string {
+	return segment(account) + "/_bookeep/datos.json"
+}
+
 // segment limpia un texto para usarlo como nombre de carpeta o de archivo:
 // sin barras ni caracteres de control, sin espacios repetidos y sin puntos
 // al final.
@@ -142,4 +154,34 @@ func segment(text string) string {
 		return "sin-nombre"
 	}
 	return out
+}
+
+// maxFolderDepth es cuántas carpetas, una dentro de otra, puede crear el usuario.
+const maxFolderDepth = 6
+
+// CleanFolder convierte lo que escribió el usuario ("Clientes/2026/ Siman ")
+// en una ruta de carpetas válida ("Clientes/2026/Siman"). Devuelve "" para la
+// raíz, y false si la ruta no se puede usar: demasiado profunda o dentro de
+// la carpeta reservada para los datos de la app.
+func CleanFolder(path string) (string, bool) {
+	var parts []string
+	for _, name := range strings.Split(strings.ReplaceAll(path, "\\", "/"), "/") {
+		if strings.TrimSpace(name) == "" {
+			continue
+		}
+		parts = append(parts, segment(name))
+	}
+	if len(parts) > maxFolderDepth || (len(parts) > 0 && strings.HasPrefix(parts[0], "_bookeep")) {
+		return "", false
+	}
+	return strings.Join(parts, "/"), true
+}
+
+// KeyIn arma la ruta de un archivo dentro de una carpeta ya limpia
+// (ver CleanFolder): cuenta/carpeta/archivo.
+func KeyIn(account, folder, filename string) string {
+	if folder == "" {
+		return segment(account) + "/" + segment(filename)
+	}
+	return segment(account) + "/" + folder + "/" + segment(filename)
 }

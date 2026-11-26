@@ -1,20 +1,4 @@
 services:
-  # PostgreSQL
-  postgres:
-    image: postgres:17
-    container_name: postgres-db
-    ports:
-      - 5435:5432 
-    restart: always
-    environment:
-      - POSTGRES_DB=${DB_NAME} 
-      - POSTGRES_USER=${DB_USER} 
-      - POSTGRES_PASSWORD=${DB_PASS} 
-    networks:
-      - api-postgres
-    volumes:
-      - postgres_local_data:/var/lib/postgresql/data:Z 
-
   # Go API
   smpt-dte:
     container_name: smpt-dte
@@ -22,8 +6,6 @@ services:
       context: ./
       dockerfile: Dockerfile
     environment:
-      - DB_STRING=${DB_STRING}
-      - DB_CONTEXT=${DB_CONTEXT}
       - TRACE_TYPE=${TRACE_TYPE}
       - SERVICE_NAME=${SERVICE_NAME}
       - OAUTH_CLIENT_ID=${OAUTH_CLIENT_ID}
@@ -31,19 +13,22 @@ services:
       - PUBLIC_ORIGIN=${PUBLIC_ORIGIN}
       - AFTER_LOGIN_PATH=${AFTER_LOGIN_PATH}
       - MAIL_PROVIDER=${MAIL_PROVIDER}
-      # Bucket donde se guardan los archivos "en la nube"
+      # Solo si MAIL_PROVIDER incluye OUTLOOK (ver .env.example)
+      - OUTLOOK_CLIENT_ID=${OUTLOOK_CLIENT_ID-}
+      - OUTLOOK_CLIENT_SECRET=${OUTLOOK_CLIENT_SECRET-}
+      - OUTLOOK_TENANT=${OUTLOOK_TENANT-}
+      # Bucket donde se guarda todo: facturas, notas y archivos
       - FILES_BUCKET=${FILES_BUCKET:-bookeep-archivos}
       # En local el bucket es un emulador. En producción, deja esta variable
       # vacía en el .env (STORAGE_EMULATOR_HOST=) y da credenciales de Google.
       - STORAGE_EMULATOR_HOST=${STORAGE_EMULATOR_HOST-gcs:4443}
     depends_on:
-      - postgres
       - gcs
     restart: always
     ports:
       - 8080:8080
     networks:
-      - api-postgres
+      - api-net
   
   # Emulador local de Google Cloud Storage (solo para desarrollo)
   gcs:
@@ -54,14 +39,13 @@ services:
       - 4443:4443
     restart: always
     networks:
-      - api-postgres
+      - api-net
     volumes:
       - gcs_local_data:/storage
 
 networks:
-  api-postgres:
+  api-net:
     driver: bridge
 
 volumes:
-  postgres_local_data: {}
   gcs_local_data: {}

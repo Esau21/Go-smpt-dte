@@ -1,68 +1,44 @@
-// Package store guarda en Postgres las facturas (DTE) leídas del correo,
-// junto con lo que el usuario anota sobre ellas: estado, categoría y notas.
+// Package store guarda los datos de cada cuenta —las facturas leídas del
+// correo, lo que el usuario anota sobre ellas y el registro de los archivos
+// guardados— como un documento JSON dentro del bucket:
+//
+//	cuenta/_bookeep/datos.json.gz
+//
+// Va comprimido: el documento de una cuenta con 20 000 facturas pesa unos
+// 10 MB en texto y cerca de 1 MB comprimido, y se sube entero en cada cambio.
+//
+// No hay base de datos. Cada lectura trae el documento y cada cambio lo
+// vuelve a escribir completo, lo que alcanza de sobra para los miles de
+// facturas de una cuenta. Los cambios de una misma cuenta se hacen de uno en
+// uno dentro de este proceso; si algún día corren varias copias de la API a
+// la vez, habrá que añadir control de versiones al escribir.
 package store
 
 import (
+	"bytes"
+	"cmp"
+	"compress/gzip"
 	"context"
+	"encoding/json"
+	"io"
 	"errors"
-	"fmt"
+	"slices"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/Esau21/Go-smpt-dte/internal/bucket"
 )
 
-const schema = `
-CREATE TABLE IF NOT EXISTS invoices (
-	id                BIGSERIAL PRIMARY KEY,
-	owner             TEXT NOT NULL,
-	codigo_generacion TEXT NOT NULL,
-	numero_control    TEXT NOT NULL DEFAULT '',
-	tipo_dte          TEXT NOT NULL DEFAULT '',
-	ambiente          TEXT NOT NULL DEFAULT '',
-	fecha             TEXT NOT NULL DEFAULT '',
-	hora              TEXT NOT NULL DEFAULT '',
-	moneda            TEXT NOT NULL DEFAULT 'USD',
-	emisor_nit        TEXT NOT NULL DEFAULT '',
-	emisor_nrc        TEXT NOT NULL DEFAULT '',
-	emisor_nombre     TEXT NOT NULL DEFAULT '',
-	receptor_doc      TEXT NOT NULL DEFAULT '',
-	receptor_nrc      TEXT NOT NULL DEFAULT '',
-	receptor_nombre   TEXT NOT NULL DEFAULT '',
-	no_sujeto         NUMERIC(14,2) NOT NULL DEFAULT 0,
-	exento            NUMERIC(14,2) NOT NULL DEFAULT 0,
-	gravado           NUMERIC(14,2) NOT NULL DEFAULT 0,
-	iva               NUMERIC(14,2) NOT NULL DEFAULT 0,
-	iva_percibido     NUMERIC(14,2) NOT NULL DEFAULT 0,
-	iva_retenido      NUMERIC(14,2) NOT NULL DEFAULT 0,
-	total             NUMERIC(14,2) NOT NULL DEFAULT 0,
-	sello             TEXT NOT NULL DEFAULT '',
-	message_id        TEXT NOT NULL DEFAULT '',
-	mail_from         TEXT NOT NULL DEFAULT '',
-	mail_subject      TEXT NOT NULL DEFAULT '',
-	status            TEXT NOT NULL DEFAULT 'pendiente',
-	category          TEXT NOT NULL DEFAULT '',
-	notes             TEXT NOT NULL DEFAULT '',
-	created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
-	updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
-	UNIQUE (owner, codigo_generacion)
-);
-CREATE INDEX IF NOT EXISTS invoices_owner_fecha ON invoices (owner, fecha DESC);
-
--- Correos ya revisados, traigan o no un DTE, para no volver a descargarlos.
-CREATE TABLE IF NOT EXISTS scanned_messages (
-	owner      TEXT NOT NULL,
-	message_id TEXT NOT NULL,
-	PRIMARY KEY (owner, message_id)
-);
-`
+// Blob es lo que el almacén necesita del bucket.
+type Blob interface {
+	Put(ctx context.Context, key string, content []byte, contentType string) error
+	Get(ctx context.Context, key string) ([]byte, error)
+	Delete(ctx context.Context, key string) error
+}
 
 // Statuses son los estados que el usuario puede asignar a una factura.
 var Statuses = []string{"pendiente", "revisada", "pagada"}
-
-// sign hace que las notas de crédito (tipo 05) resten en las sumas.
-const sign = "(CASE WHEN tipo_dte = '05' THEN -1 ELSE 1 END)"
 
 type Invoice struct {
 	ID               int64   `json:"id"`
@@ -95,125 +71,230 @@ type Invoice struct {
 	Notes            string  `json:"notes"`
 }
 
-const columns = `id, codigo_generacion, numero_control, tipo_dte, ambiente, fecha, hora, moneda,
-	emisor_nit, emisor_nrc, emisor_nombre, receptor_doc, receptor_nrc, receptor_nombre,
-	no_sujeto::float8, exento::float8, gravado::float8, iva::float8,
-	iva_percibido::float8, iva_retenido::float8, total::float8,
-	sello, message_id, mail_from, mail_subject, status, category, notes`
+// SavedFile es el registro de un archivo guardado en el bucket.
+type SavedFile struct {
+	ID          int64     `json:"id"`
+	MessageID   string    `json:"messageId"`
+	Filename    string    `json:"filename"`
+	Size        int       `json:"size"`
+	MailFrom    string    `json:"mailFrom"`
+	MailSubject string    `json:"mailSubject"`
+	CreatedAt   time.Time `json:"createdAt"`
+	// Path es la ruta del archivo dentro del bucket.
+	Path string `json:"path"`
+}
 
-func scan(row pgx.Row) (Invoice, error) {
-	var i Invoice
-	err := row.Scan(&i.ID, &i.CodigoGeneracion, &i.NumeroControl, &i.TipoDte, &i.Ambiente,
-		&i.Fecha, &i.Hora, &i.Moneda, &i.EmisorNIT, &i.EmisorNRC, &i.EmisorNombre,
-		&i.ReceptorDoc, &i.ReceptorNRC, &i.ReceptorNombre,
-		&i.NoSujeto, &i.Exento, &i.Gravado, &i.IVA, &i.IVAPercibido, &i.IVARetenido, &i.Total,
-		&i.Sello, &i.MessageID, &i.MailFrom, &i.MailSubject, &i.Status, &i.Category, &i.Notes)
-	return i, err
+// document es todo lo que se guarda de una cuenta.
+type document struct {
+	NextInvoiceID int64       `json:"nextInvoiceId"`
+	NextFileID    int64       `json:"nextFileId"`
+	Invoices      []Invoice   `json:"invoices"`
+	Files         []SavedFile `json:"files"`
+	// Scanned son los correos ya revisados, traigan o no un DTE, para no
+	// volver a descargarlos.
+	Scanned []string `json:"scanned"`
+	// Folders son las carpetas que el usuario creó a mano. Se guardan para
+	// que existan aunque estén vacías: en un bucket una carpeta solo existe
+	// mientras tenga archivos.
+	Folders []string `json:"folders"`
 }
 
 type Store struct {
-	pool *pgxpool.Pool
+	blob Blob
+
+	mu    sync.Mutex
+	locks map[string]*sync.Mutex
+	// cache guarda el último documento leído de cada cuenta. Sin esto, cada
+	// pantalla volvería a bajar y a interpretar el documento entero, que
+	// para una cuenta con miles de facturas pesa varios MB.
+	cache map[string]cached
 }
 
-// Open se conecta a Postgres y crea las tablas si no existen. Reintenta
-// unos segundos porque al levantar con Docker la base puede tardar en estar lista.
-func Open(ctx context.Context, dsn string) (*Store, error) {
-	pool, err := pgxpool.New(ctx, dsn)
+type cached struct {
+	doc *document
+	at  time.Time
+}
+
+// cacheTTL es cuánto se confía en la copia en memoria. Es corto a propósito:
+// si algún día corren varias copias de la API, limita cuánto puede tardar
+// una en ver lo que guardó otra.
+const cacheTTL = 2 * time.Minute
+
+func New(blob Blob) *Store {
+	return &Store{blob: blob, locks: map[string]*sync.Mutex{}, cache: map[string]cached{}}
+}
+
+func (s *Store) remember(account string, doc *document) {
+	s.mu.Lock()
+	s.cache[account] = cached{doc: doc, at: time.Now()}
+	s.mu.Unlock()
+}
+
+func (s *Store) forget(account string) {
+	s.mu.Lock()
+	delete(s.cache, account)
+	s.mu.Unlock()
+}
+
+// view devuelve los datos de la cuenta para consultarlos. El documento que
+// devuelve es compartido: quien lo recibe solo puede leerlo.
+func (s *Store) view(ctx context.Context, account string) (*document, error) {
+	s.mu.Lock()
+	entry, ok := s.cache[account]
+	s.mu.Unlock()
+	if ok && time.Since(entry.at) < cacheTTL {
+		return entry.doc, nil
+	}
+
+	doc, err := s.load(ctx, account)
+	if err != nil {
+		return nil, err
+	}
+	s.remember(account, doc)
+	return doc, nil
+}
+
+func (s *Store) lock(account string) *sync.Mutex {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.locks[account] == nil {
+		s.locks[account] = &sync.Mutex{}
+	}
+	return s.locks[account]
+}
+
+func (s *Store) load(ctx context.Context, account string) (*document, error) {
+	doc := &document{NextInvoiceID: 1, NextFileID: 1}
+	content, err := s.blob.Get(ctx, bucket.DataKey(account))
+	if errors.Is(err, bucket.ErrNotFound) {
+		// Cuentas guardadas antes de que el documento se comprimiera.
+		content, err = s.blob.Get(ctx, bucket.LegacyDataKey(account))
+		if errors.Is(err, bucket.ErrNotFound) {
+			return doc, nil
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
 
-	for attempt := 1; ; attempt++ {
-		// Cada intento tiene su propio límite, para no quedarse esperando
-		// a un servidor que no existe.
-		tryCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
-		_, err = pool.Exec(tryCtx, schema+filesSchema)
-		cancel()
-		if err == nil {
-			return &Store{pool: pool}, nil
+	// Comprimido empieza con los bytes 0x1f 0x8b; si no, es JSON tal cual.
+	if len(content) > 2 && content[0] == 0x1f && content[1] == 0x8b {
+		reader, err := gzip.NewReader(bytes.NewReader(content))
+		if err != nil {
+			return nil, err
 		}
-		if attempt == 6 {
-			pool.Close()
-			return nil, fmt.Errorf("database not ready: %w", err)
-		}
-		select {
-		case <-ctx.Done():
-			pool.Close()
-			return nil, ctx.Err()
-		case <-time.After(2 * time.Second):
+		if content, err = io.ReadAll(reader); err != nil {
+			return nil, err
 		}
 	}
+	if err := json.Unmarshal(content, doc); err != nil {
+		return nil, err
+	}
+	return doc, nil
 }
 
-func (s *Store) Close() { s.pool.Close() }
+// update carga los datos de la cuenta, aplica el cambio y los guarda. Si
+// `change` devuelve un error, no se guarda nada.
+func (s *Store) update(ctx context.Context, account string, change func(*document) error) error {
+	lock := s.lock(account)
+	lock.Lock()
+	defer lock.Unlock()
 
-// DeleteOwner borra todo lo guardado de una cuenta.
-func (s *Store) DeleteOwner(ctx context.Context, owner string) error {
-	if _, err := s.pool.Exec(ctx, `DELETE FROM invoices WHERE owner = $1`, owner); err != nil {
+	doc, err := s.load(ctx, account)
+	if err != nil {
 		return err
 	}
-	if _, err := s.pool.Exec(ctx, `DELETE FROM saved_files WHERE owner = $1`, owner); err != nil {
+	if err := change(doc); err != nil {
 		return err
 	}
-	_, err := s.pool.Exec(ctx, `DELETE FROM scanned_messages WHERE owner = $1`, owner)
-	return err
+	var packed bytes.Buffer
+	writer := gzip.NewWriter(&packed)
+	if err := json.NewEncoder(writer).Encode(doc); err != nil {
+		return err
+	}
+	if err := writer.Close(); err != nil {
+		return err
+	}
+	if err := s.blob.Put(ctx, bucket.DataKey(account), packed.Bytes(), "application/gzip"); err != nil {
+		// No se sabe qué quedó guardado: mejor volver a leerlo.
+		s.forget(account)
+		return err
+	}
+	// `doc` se acaba de leer del bucket y nadie más lo tiene: puede pasar a
+	// ser la copia compartida de solo lectura.
+	s.remember(account, doc)
+	// La copia sin comprimir de antes ya no hace falta.
+	_ = s.blob.Delete(ctx, bucket.LegacyDataKey(account))
+	return nil
+}
+
+// DeleteAccount borra los datos guardados de una cuenta (no sus archivos).
+func (s *Store) DeleteAccount(ctx context.Context, account string) error {
+	s.forget(account)
+	_ = s.blob.Delete(ctx, bucket.LegacyDataKey(account))
+	return s.blob.Delete(ctx, bucket.DataKey(account))
 }
 
 // Known devuelve cuáles de estos correos ya fueron revisados.
-func (s *Store) Known(ctx context.Context, owner string, ids []string) (map[string]bool, error) {
-	rows, err := s.pool.Query(ctx,
-		`SELECT message_id FROM scanned_messages WHERE owner = $1 AND message_id = ANY($2)`, owner, ids)
+func (s *Store) Known(ctx context.Context, account string, ids []string) (map[string]bool, error) {
+	doc, err := s.view(ctx, account)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-
-	known := make(map[string]bool, len(ids))
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		known[id] = true
+	wanted := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		wanted[id] = true
 	}
-	return known, rows.Err()
+	known := map[string]bool{}
+	for _, id := range doc.Scanned {
+		if wanted[id] {
+			known[id] = true
+		}
+	}
+	return known, nil
 }
 
-// MarkScanned registra que un correo ya fue revisado.
-func (s *Store) MarkScanned(ctx context.Context, owner, messageID string) error {
-	_, err := s.pool.Exec(ctx,
-		`INSERT INTO scanned_messages (owner, message_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
-		owner, messageID)
-	return err
-}
+// SaveSync guarda el resultado de revisar una tanda de correos: las facturas
+// encontradas y los correos que ya no hay que volver a revisar. Si una
+// factura ya existía (el mismo DTE llegó en otro correo) se actualizan los
+// datos del documento pero se conservan el estado, la categoría y las notas
+// del usuario. Devuelve cuántas facturas son nuevas.
+func (s *Store) SaveSync(ctx context.Context, account string, found []Invoice, scanned []string) (int, error) {
+	imported := 0
+	err := s.update(ctx, account, func(doc *document) error {
+		byCode := make(map[string]int, len(doc.Invoices))
+		for i, old := range doc.Invoices {
+			byCode[old.CodigoGeneracion] = i
+		}
+		for _, invoice := range found {
+			if i, exists := byCode[invoice.CodigoGeneracion]; exists {
+				old := doc.Invoices[i]
+				invoice.ID, invoice.Status, invoice.Category, invoice.Notes = old.ID, old.Status, old.Category, old.Notes
+				invoice.MessageID, invoice.MailFrom, invoice.MailSubject = old.MessageID, old.MailFrom, old.MailSubject
+				doc.Invoices[i] = invoice
+				continue
+			}
+			invoice.ID = doc.NextInvoiceID
+			doc.NextInvoiceID++
+			invoice.Status = "pendiente"
+			byCode[invoice.CodigoGeneracion] = len(doc.Invoices)
+			doc.Invoices = append(doc.Invoices, invoice)
+			imported++
+		}
 
-// Upsert guarda una factura. Si ya existía (el mismo DTE llegó en otro
-// correo) actualiza los datos del documento pero conserva el estado, la
-// categoría y las notas del usuario. Devuelve true si la factura es nueva.
-func (s *Store) Upsert(ctx context.Context, owner string, i Invoice) (bool, error) {
-	var inserted bool
-	err := s.pool.QueryRow(ctx, `
-		INSERT INTO invoices (owner, codigo_generacion, numero_control, tipo_dte, ambiente, fecha, hora,
-			moneda, emisor_nit, emisor_nrc, emisor_nombre, receptor_doc, receptor_nrc, receptor_nombre,
-			no_sujeto, exento, gravado, iva, iva_percibido, iva_retenido, total, sello,
-			message_id, mail_from, mail_subject)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
-		ON CONFLICT (owner, codigo_generacion) DO UPDATE SET
-			numero_control = EXCLUDED.numero_control, tipo_dte = EXCLUDED.tipo_dte,
-			ambiente = EXCLUDED.ambiente, fecha = EXCLUDED.fecha, hora = EXCLUDED.hora,
-			moneda = EXCLUDED.moneda, emisor_nit = EXCLUDED.emisor_nit, emisor_nrc = EXCLUDED.emisor_nrc,
-			emisor_nombre = EXCLUDED.emisor_nombre, receptor_doc = EXCLUDED.receptor_doc,
-			receptor_nrc = EXCLUDED.receptor_nrc, receptor_nombre = EXCLUDED.receptor_nombre,
-			no_sujeto = EXCLUDED.no_sujeto, exento = EXCLUDED.exento, gravado = EXCLUDED.gravado,
-			iva = EXCLUDED.iva, iva_percibido = EXCLUDED.iva_percibido,
-			iva_retenido = EXCLUDED.iva_retenido, total = EXCLUDED.total, sello = EXCLUDED.sello,
-			updated_at = now()
-		RETURNING (xmax = 0)`,
-		owner, i.CodigoGeneracion, i.NumeroControl, i.TipoDte, i.Ambiente, i.Fecha, i.Hora,
-		i.Moneda, i.EmisorNIT, i.EmisorNRC, i.EmisorNombre, i.ReceptorDoc, i.ReceptorNRC, i.ReceptorNombre,
-		i.NoSujeto, i.Exento, i.Gravado, i.IVA, i.IVAPercibido, i.IVARetenido, i.Total, i.Sello,
-		i.MessageID, i.MailFrom, i.MailSubject).Scan(&inserted)
-	return inserted, err
+		seen := make(map[string]bool, len(doc.Scanned))
+		for _, id := range doc.Scanned {
+			seen[id] = true
+		}
+		for _, id := range scanned {
+			if !seen[id] {
+				seen[id] = true
+				doc.Scanned = append(doc.Scanned, id)
+			}
+		}
+		return nil
+	})
+	return imported, err
 }
 
 // Filter son los criterios para listar facturas. Los campos vacíos no filtran.
@@ -223,38 +304,39 @@ type Filter struct {
 	Status string
 	Tipo   string
 	Search string // emisor, NIT, NRC, número de control o categoría
-	Limit  int    // 0 = sin límite
+	// Sort es el orden: "" (fecha, lo más nuevo primero), "fecha_asc",
+	// "total_desc", "total_asc" o "emisor_asc".
+	Sort   string
+	Limit  int // 0 = sin límite
 	Offset int
 }
 
-func (f Filter) where(owner string) (string, []any) {
-	clauses := []string{"owner = $1"}
-	args := []any{owner}
-	add := func(clause string, value any) {
-		args = append(args, value)
-		clauses = append(clauses, fmt.Sprintf(clause, len(args)))
-	}
+// Sorts son los órdenes que acepta Filter.Sort.
+var Sorts = []string{"", "fecha_asc", "total_desc", "total_asc", "emisor_asc"}
 
-	if f.From != "" {
-		add("fecha >= $%d", f.From)
+func (f Filter) matches(i Invoice) bool {
+	if f.From != "" && i.Fecha < f.From {
+		return false
 	}
-	if f.To != "" {
-		add("fecha <= $%d", f.To)
+	if f.To != "" && i.Fecha > f.To {
+		return false
 	}
-	if f.Status != "" {
-		add("status = $%d", f.Status)
+	if f.Status != "" && i.Status != f.Status {
+		return false
 	}
-	if f.Tipo != "" {
-		add("tipo_dte = $%d", f.Tipo)
+	if f.Tipo != "" && i.TipoDte != f.Tipo {
+		return false
 	}
-	if f.Search != "" {
-		args = append(args, "%"+strings.ToLower(f.Search)+"%")
-		n := len(args)
-		clauses = append(clauses, fmt.Sprintf(
-			"(lower(emisor_nombre) LIKE $%d OR emisor_nit LIKE $%d OR emisor_nrc LIKE $%d OR lower(numero_control) LIKE $%d OR lower(category) LIKE $%d)",
-			n, n, n, n, n))
+	if f.Search == "" {
+		return true
 	}
-	return strings.Join(clauses, " AND "), args
+	q := strings.ToLower(f.Search)
+	for _, field := range []string{i.EmisorNombre, i.EmisorNIT, i.EmisorNRC, i.NumeroControl, i.Category} {
+		if strings.Contains(strings.ToLower(field), q) {
+			return true
+		}
+	}
+	return false
 }
 
 // Totals son las sumas de un conjunto de facturas (las notas de crédito restan).
@@ -265,44 +347,110 @@ type Totals struct {
 	Total   float64 `json:"total"`
 }
 
-const totals = `count(*)::int, coalesce(sum(gravado * ` + sign + `), 0)::float8,
-	coalesce(sum(iva * ` + sign + `), 0)::float8, coalesce(sum(total * ` + sign + `), 0)::float8`
+func (t *Totals) add(i Invoice) {
+	sign := 1.0
+	if i.TipoDte == "05" { // nota de crédito
+		sign = -1
+	}
+	t.Count++
+	t.Gravado += sign * i.Gravado
+	t.IVA += sign * i.IVA
+	t.Total += sign * i.Total
+}
+
+// round quita los decimales de más que deja sumar números con punto flotante.
+func (t *Totals) round() {
+	cents := func(v float64) float64 {
+		if v < 0 {
+			return float64(int64(v*100-0.5)) / 100
+		}
+		return float64(int64(v*100+0.5)) / 100
+	}
+	t.Gravado, t.IVA, t.Total = cents(t.Gravado), cents(t.IVA), cents(t.Total)
+}
 
 // List devuelve las facturas que cumplen el filtro, de la más reciente a la
 // más antigua, y las sumas de todas las que cumplen (no solo de la página).
-func (s *Store) List(ctx context.Context, owner string, f Filter) ([]Invoice, Totals, error) {
-	where, args := f.where(owner)
-
-	var t Totals
-	err := s.pool.QueryRow(ctx, "SELECT "+totals+" FROM invoices WHERE "+where, args...).
-		Scan(&t.Count, &t.Gravado, &t.IVA, &t.Total)
+func (s *Store) List(ctx context.Context, account string, f Filter) ([]Invoice, Totals, error) {
+	var totals Totals
+	doc, err := s.view(ctx, account)
 	if err != nil {
-		return nil, t, err
+		return nil, totals, err
 	}
-
-	query := "SELECT " + columns + " FROM invoices WHERE " + where + " ORDER BY fecha DESC, hora DESC, id DESC"
-	if f.Limit > 0 {
-		query += fmt.Sprintf(" LIMIT %d OFFSET %d", f.Limit, f.Offset)
-	}
-	rows, err := s.pool.Query(ctx, query, args...)
-	if err != nil {
-		return nil, t, err
-	}
-	defer rows.Close()
 
 	items := []Invoice{}
-	for rows.Next() {
-		i, err := scan(rows)
-		if err != nil {
-			return nil, t, err
+	for _, invoice := range doc.Invoices {
+		if f.matches(invoice) {
+			items = append(items, invoice)
+			totals.add(invoice)
 		}
-		items = append(items, i)
 	}
-	return items, t, rows.Err()
+	totals.round()
+
+	newest := func(a, b Invoice) int {
+		return cmp.Or(cmp.Compare(b.Fecha, a.Fecha), cmp.Compare(b.Hora, a.Hora), cmp.Compare(b.ID, a.ID))
+	}
+	slices.SortFunc(items, func(a, b Invoice) int {
+		switch f.Sort {
+		case "fecha_asc":
+			return -newest(a, b)
+		case "total_desc":
+			return cmp.Or(cmp.Compare(b.Total, a.Total), newest(a, b))
+		case "total_asc":
+			return cmp.Or(cmp.Compare(a.Total, b.Total), newest(a, b))
+		case "emisor_asc":
+			return cmp.Or(cmp.Compare(strings.ToLower(a.EmisorNombre), strings.ToLower(b.EmisorNombre)), newest(a, b))
+		}
+		return newest(a, b)
+	})
+
+	if f.Limit > 0 {
+		start := min(f.Offset, len(items))
+		items = items[start:min(start+f.Limit, len(items))]
+	}
+	return items, totals, nil
 }
 
-// ErrNotFound indica que la factura no existe o es de otra cuenta.
-var ErrNotFound = errors.New("invoice not found")
+// StatusCounts cuenta, para cada estado, las facturas que cumplen el filtro
+// sin tener en cuenta el estado elegido. Sirve para las pestañas
+// "Pendientes (12) · Revisadas (3) · Pagadas (40)".
+func (s *Store) StatusCounts(ctx context.Context, account string, f Filter) (map[string]int, error) {
+	doc, err := s.view(ctx, account)
+	if err != nil {
+		return nil, err
+	}
+	f.Status = ""
+	counts := map[string]int{}
+	for _, invoice := range doc.Invoices {
+		if f.matches(invoice) {
+			counts[invoice.Status]++
+		}
+	}
+	return counts, nil
+}
+
+// UpdateMany cambia el estado de varias facturas de una vez. Devuelve
+// cuántas existían y quedaron con ese estado.
+func (s *Store) UpdateMany(ctx context.Context, account string, ids []int64, status string) (int, error) {
+	updated := 0
+	err := s.update(ctx, account, func(doc *document) error {
+		wanted := make(map[int64]bool, len(ids))
+		for _, id := range ids {
+			wanted[id] = true
+		}
+		for i := range doc.Invoices {
+			if wanted[doc.Invoices[i].ID] {
+				doc.Invoices[i].Status = status
+				updated++
+			}
+		}
+		return nil
+	})
+	return updated, err
+}
+
+// ErrNotFound indica que la factura o el archivo no existen en esta cuenta.
+var ErrNotFound = errors.New("not found")
 
 // Patch son los campos que el usuario puede cambiar; nil = no tocar.
 type Patch struct {
@@ -311,21 +459,27 @@ type Patch struct {
 	Notes    *string `json:"notes"`
 }
 
-func (s *Store) Update(ctx context.Context, owner string, id int64, p Patch) (Invoice, error) {
-	row := s.pool.QueryRow(ctx, `
-		UPDATE invoices SET
-			status = coalesce($3, status),
-			category = coalesce($4, category),
-			notes = coalesce($5, notes),
-			updated_at = now()
-		WHERE owner = $1 AND id = $2
-		RETURNING `+columns, owner, id, p.Status, p.Category, p.Notes)
-
-	i, err := scan(row)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return i, ErrNotFound
-	}
-	return i, err
+func (s *Store) Update(ctx context.Context, account string, id int64, p Patch) (Invoice, error) {
+	var updated Invoice
+	err := s.update(ctx, account, func(doc *document) error {
+		i := slices.IndexFunc(doc.Invoices, func(invoice Invoice) bool { return invoice.ID == id })
+		if i < 0 {
+			return ErrNotFound
+		}
+		invoice := &doc.Invoices[i]
+		if p.Status != nil {
+			invoice.Status = *p.Status
+		}
+		if p.Category != nil {
+			invoice.Category = *p.Category
+		}
+		if p.Notes != nil {
+			invoice.Notes = *p.Notes
+		}
+		updated = *invoice
+		return nil
+	})
+	return updated, err
 }
 
 type MonthTotal struct {
@@ -339,94 +493,136 @@ type IssuerTotal struct {
 	Totals
 }
 
+// NamedTotal son las sumas de un grupo con nombre (un tipo de documento,
+// una categoría).
+type NamedTotal struct {
+	Name string `json:"name"`
+	Totals
+}
+
 type Summary struct {
 	Months     []MonthTotal   `json:"months"`
 	Issuers    []IssuerTotal  `json:"issuers"`
 	ByStatus   map[string]int `json:"byStatus"`
 	Categories []string       `json:"categories"`
+	// Recent son las últimas facturas, de la más nueva a la más vieja.
+	Recent []Invoice `json:"recent"`
+	// Types son las sumas por tipo de documento (01, 03, ...).
+	Types []NamedTotal `json:"types"`
+	// CategoryTotals son las sumas por categoría; las facturas sin
+	// categoría van bajo el nombre "".
+	CategoryTotals []NamedTotal `json:"categoryTotals"`
+	// Pending es lo que suman las facturas que no están pagadas.
+	Pending Totals `json:"pending"`
 }
 
 // Summary resume las facturas con fecha desde `since` (AAAA-MM-DD): totales
-// por mes, emisores a los que más se les compra y cuántas hay en cada estado.
-func (s *Store) Summary(ctx context.Context, owner, since string) (Summary, error) {
+// por mes, los seis emisores a los que más se les compra, cuántas facturas
+// hay en cada estado y las categorías que el usuario ha usado.
+func (s *Store) Summary(ctx context.Context, account, since string) (Summary, error) {
 	out := Summary{
-		Months:     []MonthTotal{},
-		Issuers:    []IssuerTotal{},
-		ByStatus:   map[string]int{},
-		Categories: []string{},
+		Months:         []MonthTotal{},
+		Issuers:        []IssuerTotal{},
+		ByStatus:       map[string]int{},
+		Categories:     []string{},
+		Recent:         []Invoice{},
+		Types:          []NamedTotal{},
+		CategoryTotals: []NamedTotal{},
 	}
-
-	rows, err := s.pool.Query(ctx, `
-		SELECT substr(fecha, 1, 7), `+totals+`
-		FROM invoices WHERE owner = $1 AND fecha >= $2
-		GROUP BY 1 ORDER BY 1`, owner, since)
+	doc, err := s.view(ctx, account)
 	if err != nil {
 		return out, err
 	}
-	for rows.Next() {
-		var m MonthTotal
-		if err := rows.Scan(&m.Month, &m.Count, &m.Gravado, &m.IVA, &m.Total); err != nil {
-			rows.Close()
-			return out, err
+
+	months := map[string]*MonthTotal{}
+	issuers := map[string]*IssuerTotal{}
+	types := map[string]*NamedTotal{}
+	categories := map[string]*NamedTotal{}
+	named := func(group map[string]*NamedTotal, name string, invoice Invoice) {
+		if group[name] == nil {
+			group[name] = &NamedTotal{Name: name}
 		}
-		out.Months = append(out.Months, m)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return out, err
+		group[name].add(invoice)
 	}
 
-	rows, err = s.pool.Query(ctx, `
-		SELECT max(emisor_nombre), emisor_nit, `+totals+`
-		FROM invoices WHERE owner = $1 AND fecha >= $2
-		GROUP BY emisor_nit ORDER BY 6 DESC LIMIT 6`, owner, since)
-	if err != nil {
-		return out, err
-	}
-	for rows.Next() {
-		var e IssuerTotal
-		if err := rows.Scan(&e.Nombre, &e.NIT, &e.Count, &e.Gravado, &e.IVA, &e.Total); err != nil {
-			rows.Close()
-			return out, err
+	for _, invoice := range doc.Invoices {
+		out.ByStatus[invoice.Status]++
+		if invoice.Status != "pagada" {
+			out.Pending.add(invoice)
 		}
-		out.Issuers = append(out.Issuers, e)
+		if invoice.Category != "" && !slices.Contains(out.Categories, invoice.Category) {
+			out.Categories = append(out.Categories, invoice.Category)
+		}
+		if invoice.Fecha < since || len(invoice.Fecha) < 7 {
+			continue
+		}
+
+		month := invoice.Fecha[:7]
+		if months[month] == nil {
+			months[month] = &MonthTotal{Month: month}
+		}
+		months[month].add(invoice)
+
+		if issuers[invoice.EmisorNIT] == nil {
+			issuers[invoice.EmisorNIT] = &IssuerTotal{Nombre: invoice.EmisorNombre, NIT: invoice.EmisorNIT}
+		}
+		issuers[invoice.EmisorNIT].add(invoice)
+
+		named(types, invoice.TipoDte, invoice)
+		named(categories, invoice.Category, invoice)
 	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return out, err
+	out.Pending.round()
+
+	for _, group := range []struct {
+		from map[string]*NamedTotal
+		to   *[]NamedTotal
+	}{{types, &out.Types}, {categories, &out.CategoryTotals}} {
+		for _, total := range group.from {
+			total.round()
+			*group.to = append(*group.to, *total)
+		}
+		slices.SortFunc(*group.to, func(a, b NamedTotal) int {
+			return cmp.Or(cmp.Compare(b.Total, a.Total), cmp.Compare(a.Name, b.Name))
+		})
 	}
 
-	rows, err = s.pool.Query(ctx,
-		`SELECT status, count(*)::int FROM invoices WHERE owner = $1 GROUP BY status`, owner)
-	if err != nil {
-		return out, err
-	}
-	for rows.Next() {
-		var status string
-		var n int
-		if err := rows.Scan(&status, &n); err != nil {
-			rows.Close()
-			return out, err
-		}
-		out.ByStatus[status] = n
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return out, err
-	}
+	// Las últimas facturas: se ordena una copia, no la lista compartida.
+	recent := slices.Clone(doc.Invoices)
+	slices.SortFunc(recent, func(a, b Invoice) int {
+		return cmp.Or(cmp.Compare(b.Fecha, a.Fecha), cmp.Compare(b.Hora, a.Hora), cmp.Compare(b.ID, a.ID))
+	})
+	out.Recent = slices.Clone(recent[:min(6, len(recent))])
 
-	rows, err = s.pool.Query(ctx,
-		`SELECT DISTINCT category FROM invoices WHERE owner = $1 AND category <> '' ORDER BY 1`, owner)
+	for _, m := range months {
+		m.round()
+		out.Months = append(out.Months, *m)
+	}
+	slices.SortFunc(out.Months, func(a, b MonthTotal) int { return cmp.Compare(a.Month, b.Month) })
+
+	for _, issuer := range issuers {
+		issuer.round()
+		out.Issuers = append(out.Issuers, *issuer)
+	}
+	slices.SortFunc(out.Issuers, func(a, b IssuerTotal) int {
+		return cmp.Or(cmp.Compare(b.Total, a.Total), cmp.Compare(a.Nombre, b.Nombre))
+	})
+	out.Issuers = out.Issuers[:min(6, len(out.Issuers))]
+
+	slices.Sort(out.Categories)
+	return out, nil
+}
+
+// InvoiceOfMessage devuelve la fecha y el emisor de la factura que llegó en
+// un correo. ok es false si ese correo no trajo ninguna factura conocida.
+func (s *Store) InvoiceOfMessage(ctx context.Context, account, messageID string) (fecha, emisor string, ok bool) {
+	doc, err := s.view(ctx, account)
 	if err != nil {
-		return out, err
+		return "", "", false
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var category string
-		if err := rows.Scan(&category); err != nil {
-			return out, err
+	for _, invoice := range doc.Invoices {
+		if invoice.MessageID == messageID {
+			return invoice.Fecha, invoice.EmisorNombre, true
 		}
-		out.Categories = append(out.Categories, category)
 	}
-	return out, rows.Err()
+	return "", "", false
 }

@@ -3,15 +3,21 @@ package mail_gmail
 import (
 	"encoding/base64"
 	"errors"
+	"mime"
 	"strings"
 
 	"github.com/Esau21/Go-smpt-dte/internal/mailbox"
 	"github.com/gin-gonic/gin"
-	"github.com/jhillyerd/enmime/v2"
+	"golang.org/x/net/html/charset"
+	"google.golang.org/api/gmail/v1"
 )
 
 // dteQuery encuentra los correos que traen un .json adjunto.
 const dteQuery = "filename:json"
+
+// maxDTESize es el tamaño máximo de un .json que se intenta leer como DTE.
+// Un DTE real pesa unos pocos KB.
+const maxDTESize = 5 << 20
 
 var errNoSession = errors.New("no mail session")
 
@@ -42,6 +48,7 @@ func (*GmailClient) ListDTEMessages(c *gin.Context, pageToken string, limit int)
 		Q(dteQuery).
 		MaxResults(int64(limit)).
 		PageToken(pageToken).
+		Fields("messages(id),nextPageToken").
 		Context(c.Request.Context()).Do()
 	if err != nil {
 		return nil, "", err
@@ -54,35 +61,91 @@ func (*GmailClient) ListDTEMessages(c *gin.Context, pageToken string, limit int)
 	return ids, page.NextPageToken, nil
 }
 
-// FetchDTE descarga un correo y devuelve su .json adjunto. Si el correo no
-// trae ninguno, devuelve nil sin error.
+// findJSONPart busca, entre las partes del correo, el primer adjunto .json.
+func findJSONPart(part *gmail.MessagePart) *gmail.MessagePart {
+	if part == nil {
+		return nil
+	}
+	if strings.HasSuffix(strings.ToLower(part.Filename), ".json") && part.Body != nil {
+		return part
+	}
+	for _, child := range part.Parts {
+		if found := findJSONPart(child); found != nil {
+			return found
+		}
+	}
+	return nil
+}
+
+// decodeBody decodifica el contenido que entrega Gmail (base64 para URL,
+// con o sin relleno).
+func decodeBody(data string) ([]byte, error) {
+	return base64.RawURLEncoding.DecodeString(strings.TrimRight(data, "="))
+}
+
+// headerOf devuelve una cabecera del correo, ya legible: los asuntos y
+// nombres con tildes viajan codificados.
+func headerOf(m *gmail.Message, name string) string {
+	if m.Payload == nil {
+		return ""
+	}
+	decoder := mime.WordDecoder{CharsetReader: charset.NewReaderLabel}
+	for _, h := range m.Payload.Headers {
+		if strings.EqualFold(h.Name, name) {
+			if value, err := decoder.DecodeHeader(h.Value); err == nil {
+				return value
+			}
+			return h.Value
+		}
+	}
+	return ""
+}
+
+// FetchDTE devuelve el .json adjunto de un correo. Si el correo no trae
+// ninguno, devuelve nil sin error.
+//
+// No descarga el correo completo: pide solo su estructura y después el
+// adjunto .json. Así un correo con un PDF de varios MB cuesta unos pocos KB,
+// que es lo que hace viable sincronizar cuentas con miles de facturas.
 func (*GmailClient) FetchDTE(c *gin.Context, id string) (*mailbox.Message, error) {
 	s, ok := sessionOf(c)
 	if !ok {
 		return nil, errNoSession
 	}
+	ctx := c.Request.Context()
 
 	m, err := s.gmail.Users.Messages.Get("me", id).
-		Format("raw").Fields("id,raw").
-		Context(c.Request.Context()).Do()
+		Format("full").
+		Fields("id,payload").
+		Context(ctx).Do()
 	if err != nil {
 		return nil, err
 	}
 
-	raw := strings.NewReader(strings.TrimRight(m.Raw, "="))
-	mail, err := enmime.ReadEnvelope(base64.NewDecoder(base64.RawURLEncoding, raw))
-	if err != nil {
+	part := findJSONPart(m.Payload)
+	if part == nil || part.Body.Size > maxDTESize {
 		return nil, nil
 	}
-	content, ok := findDTE(mail)
-	if !ok {
+
+	data := part.Body.Data
+	if data == "" && part.Body.AttachmentId != "" {
+		attachment, err := s.gmail.Users.Messages.Attachments.
+			Get("me", id, part.Body.AttachmentId).
+			Context(ctx).Do()
+		if err != nil {
+			return nil, err
+		}
+		data = attachment.Data
+	}
+	content, err := decodeBody(data)
+	if err != nil || len(content) == 0 {
 		return nil, nil
 	}
 
 	return &mailbox.Message{
 		ID:      m.Id,
-		From:    mail.GetHeader("From"),
-		Subject: mail.GetHeader("Subject"),
+		From:    headerOf(m, "From"),
+		Subject: headerOf(m, "Subject"),
 		DTE:     content,
 	}, nil
 }

@@ -2,8 +2,10 @@ package mail
 
 import (
 	"errors"
+	"strings"
 
 	mail_gmail "github.com/Esau21/Go-smpt-dte/internal/mail/gmail"
+	mail_outlook "github.com/Esau21/Go-smpt-dte/internal/mail/outlook"
 	"github.com/Esau21/Go-smpt-dte/internal/mailbox"
 	"github.com/Esau21/Go-smpt-dte/internal/validations"
 	"github.com/gin-gonic/gin"
@@ -26,7 +28,13 @@ type IMail interface {
 	FetchDTE(c *gin.Context, id string) (*mailbox.Message, error)
 	FetchAttachment(c *gin.Context, id string, index int) (*mailbox.Attachment, error)
 	ErrorStatus(err error) int
+
+	// Providers lista los proveedores con los que se puede iniciar sesión
+	// ("gmail", "outlook"), en el orden en que se ofrecen.
+	Providers() []string
 }
+
+var errNoProvider = errors.New("no mail provider for this request")
 
 func NewMail(origin, afterlogin string) (IMail, error) {
 	mail, err := validations.RequiredEnv("MAIL_PROVIDER")
@@ -35,10 +43,39 @@ func NewMail(origin, afterlogin string) (IMail, error) {
 		return nil, err
 	}
 
-	switch mail {
-	case "GMAIL":
-		return mail_gmail.SetupGmail(origin, afterlogin)
-	default:
-		return nil, errors.New("Mail provider not supported")
+	// MAIL_PROVIDER admite uno o varios, separados por coma: "GMAIL,OUTLOOK".
+	all := &multi{providers: map[string]provider{}}
+	for _, name := range strings.Split(mail, ",") {
+		var (
+			p   provider
+			err error
+		)
+		name = strings.ToLower(strings.TrimSpace(name))
+		switch name {
+		case "gmail":
+			p, err = mail_gmail.SetupGmail(origin, afterlogin)
+		case "outlook":
+			p, err = mail_outlook.Setup(origin, afterlogin)
+		case "":
+			continue
+		default:
+			return nil, errors.New("Mail provider not supported: " + name)
+		}
+		if err != nil {
+			return nil, err
+		}
+		if _, repeated := all.providers[name]; !repeated {
+			all.names = append(all.names, name)
+			all.providers[name] = p
+		}
 	}
+
+	switch len(all.names) {
+	case 0:
+		return nil, errors.New("Mail provider not supported")
+	case 1:
+		// Con un solo proveedor no hace falta repartir nada.
+		return all.providers[all.names[0]], nil
+	}
+	return all, nil
 }

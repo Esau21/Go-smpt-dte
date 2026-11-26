@@ -1,6 +1,8 @@
 package mail_gmail
 
 import (
+	"html"
+	"slices"
 	"mime"
 	"net/textproto"
 
@@ -22,5 +24,10 @@ func summary(m *gmail.Message) gin.H {
 			headers.Add(h.Name, value)
 		}
 	}
-	return fields(m, headers.Get)
+	result := fields(m, headers.Get)
+	// Las primeras palabras del correo y si aún no se ha leído, para que la
+	// lista se parezca a la bandeja de Gmail.
+	result["snippet"] = html.UnescapeString(m.Snippet)
+	result["unread"] = slices.Contains(m.LabelIds, "UNREAD")
+	return result
 }

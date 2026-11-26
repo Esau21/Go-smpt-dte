@@ -1,173 +1,161 @@
 package store
 
 import (
+	"cmp"
 	"context"
 	"errors"
+	"slices"
+	"strings"
 	"time"
-
-	"github.com/jackc/pgx/v5"
 )
 
-// filesSchema crea la tabla de archivos guardados "en la nube": los
-// adjuntos (PDF, JSON) que el usuario decide conservar.
-//
-// El contenido vive en el bucket, en la ruta `object_key`; aquí solo queda
-// el registro. La columna `content` se conserva para los archivos guardados
-// antes de que existiera el bucket, y para cuando no hay bucket configurado.
-const filesSchema = `
-CREATE TABLE IF NOT EXISTS saved_files (
-	id           BIGSERIAL PRIMARY KEY,
-	owner        TEXT NOT NULL,
-	message_id   TEXT NOT NULL,
-	filename     TEXT NOT NULL,
-	size         INT NOT NULL,
-	content      BYTEA,
-	mail_from    TEXT NOT NULL DEFAULT '',
-	mail_subject TEXT NOT NULL DEFAULT '',
-	created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
-	UNIQUE (owner, message_id, filename)
-);
-CREATE INDEX IF NOT EXISTS saved_files_owner ON saved_files (owner, created_at DESC);
-ALTER TABLE saved_files ADD COLUMN IF NOT EXISTS object_key TEXT NOT NULL DEFAULT '';
-ALTER TABLE saved_files ALTER COLUMN content DROP NOT NULL;
-`
-
-// SavedFile describe un archivo guardado, sin su contenido.
-type SavedFile struct {
-	ID          int64     `json:"id"`
-	MessageID   string    `json:"messageId"`
-	Filename    string    `json:"filename"`
-	Size        int       `json:"size"`
-	MailFrom    string    `json:"mailFrom"`
-	MailSubject string    `json:"mailSubject"`
-	CreatedAt   time.Time `json:"createdAt"`
-	// Path es la ruta del archivo dentro del bucket; vacía si el archivo
-	// está guardado en la base de datos.
-	Path string `json:"path"`
-}
-
-const fileColumns = `id, message_id, filename, size, mail_from, mail_subject, created_at, object_key`
-
-func scanFile(row pgx.Row) (SavedFile, error) {
-	var f SavedFile
-	err := row.Scan(&f.ID, &f.MessageID, &f.Filename, &f.Size, &f.MailFrom, &f.MailSubject, &f.CreatedAt, &f.Path)
+// SaveFile registra un archivo que ya se subió al bucket (en `f.Path`).
+// Guardar dos veces el mismo adjunto de un correo reemplaza el registro en
+// vez de duplicarlo.
+func (s *Store) SaveFile(ctx context.Context, account string, f SavedFile) (SavedFile, error) {
+	err := s.update(ctx, account, func(doc *document) error {
+		f.CreatedAt = time.Now().UTC()
+		i := slices.IndexFunc(doc.Files, func(old SavedFile) bool {
+			return old.MessageID == f.MessageID && old.Filename == f.Filename
+		})
+		if i >= 0 {
+			f.ID = doc.Files[i].ID
+			doc.Files[i] = f
+			return nil
+		}
+		f.ID = doc.NextFileID
+		doc.NextFileID++
+		doc.Files = append(doc.Files, f)
+		return nil
+	})
 	return f, err
-}
-
-// SaveFile registra un archivo guardado. Si `f.Path` trae la ruta del
-// bucket, el contenido no se guarda aquí (solo su tamaño); si viene vacía,
-// el contenido queda en la base de datos. Guardar dos veces el mismo adjunto
-// reemplaza el registro en vez de duplicarlo.
-func (s *Store) SaveFile(ctx context.Context, owner string, f SavedFile, content []byte) (SavedFile, error) {
-	var stored []byte
-	if f.Path == "" {
-		stored = content
-	}
-	row := s.pool.QueryRow(ctx, `
-		INSERT INTO saved_files (owner, message_id, filename, size, content, mail_from, mail_subject, object_key)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-		ON CONFLICT (owner, message_id, filename) DO UPDATE SET
-			size = EXCLUDED.size, content = EXCLUDED.content, object_key = EXCLUDED.object_key,
-			mail_from = EXCLUDED.mail_from, mail_subject = EXCLUDED.mail_subject
-		RETURNING `+fileColumns,
-		owner, f.MessageID, f.Filename, len(content), stored, f.MailFrom, f.MailSubject, f.Path)
-	return scanFile(row)
 }
 
 // ListFiles devuelve los archivos guardados, ordenados por su ruta (año,
 // mes y emisor) con lo más reciente primero. Si messageID no está vacío,
 // solo los de ese correo.
-func (s *Store) ListFiles(ctx context.Context, owner, messageID string) ([]SavedFile, error) {
-	rows, err := s.pool.Query(ctx, `
-		SELECT `+fileColumns+` FROM saved_files
-		WHERE owner = $1 AND ($2 = '' OR message_id = $2)
-		ORDER BY object_key DESC, created_at DESC, id DESC`, owner, messageID)
+func (s *Store) ListFiles(ctx context.Context, account, messageID string) ([]SavedFile, error) {
+	doc, err := s.view(ctx, account)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-
 	files := []SavedFile{}
-	for rows.Next() {
-		f, err := scanFile(rows)
-		if err != nil {
-			return nil, err
+	for _, f := range doc.Files {
+		if messageID == "" || f.MessageID == messageID {
+			files = append(files, f)
 		}
-		files = append(files, f)
 	}
-	return files, rows.Err()
+	slices.SortFunc(files, func(a, b SavedFile) int {
+		return cmp.Or(cmp.Compare(b.Path, a.Path), b.CreatedAt.Compare(a.CreatedAt))
+	})
+	return files, nil
 }
 
-// FileContent devuelve un archivo guardado. `content` es nil cuando el
-// contenido está en el bucket (en `Path`).
-func (s *Store) FileContent(ctx context.Context, owner string, id int64) (SavedFile, []byte, error) {
-	var content []byte
-	var f SavedFile
-	err := s.pool.QueryRow(ctx, `
-		SELECT `+fileColumns+`, content FROM saved_files WHERE owner = $1 AND id = $2`, owner, id).
-		Scan(&f.ID, &f.MessageID, &f.Filename, &f.Size, &f.MailFrom, &f.MailSubject, &f.CreatedAt, &f.Path, &content)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return f, nil, ErrNotFound
+// File devuelve el registro de un archivo guardado.
+func (s *Store) File(ctx context.Context, account string, id int64) (SavedFile, error) {
+	doc, err := s.view(ctx, account)
+	if err != nil {
+		return SavedFile{}, err
 	}
-	return f, content, err
+	for _, f := range doc.Files {
+		if f.ID == id {
+			return f, nil
+		}
+	}
+	return SavedFile{}, ErrNotFound
 }
 
-// DeleteFile borra el registro y devuelve la ruta que tenía en el bucket
-// (vacía si estaba en la base de datos), para borrar también el objeto.
-func (s *Store) DeleteFile(ctx context.Context, owner string, id int64) (string, error) {
+// DeleteFile borra el registro de un archivo y devuelve la ruta que tenía
+// en el bucket, para borrar también el objeto.
+func (s *Store) DeleteFile(ctx context.Context, account string, id int64) (string, error) {
 	var path string
-	err := s.pool.QueryRow(ctx,
-		`DELETE FROM saved_files WHERE owner = $1 AND id = $2 RETURNING object_key`, owner, id).Scan(&path)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return "", ErrNotFound
-	}
+	err := s.update(ctx, account, func(doc *document) error {
+		i := slices.IndexFunc(doc.Files, func(f SavedFile) bool { return f.ID == id })
+		if i < 0 {
+			return ErrNotFound
+		}
+		path = doc.Files[i].Path
+		doc.Files = slices.Delete(doc.Files, i, i+1)
+		return nil
+	})
 	return path, err
 }
 
-// KeyTaken dice si otra entrada de esta cuenta (de un correo distinto) ya
-// usa esa ruta del bucket.
-func (s *Store) KeyTaken(ctx context.Context, owner, key, messageID string) (bool, error) {
-	var taken bool
-	err := s.pool.QueryRow(ctx, `
-		SELECT EXISTS (SELECT 1 FROM saved_files WHERE owner = $1 AND object_key = $2 AND message_id <> $3)`,
-		owner, key, messageID).Scan(&taken)
-	return taken, err
+// KeyTaken dice si un archivo de otro correo ya ocupa esa ruta del bucket.
+func (s *Store) KeyTaken(ctx context.Context, account, key, messageID string) (bool, error) {
+	doc, err := s.view(ctx, account)
+	if err != nil {
+		return false, err
+	}
+	return slices.ContainsFunc(doc.Files, func(f SavedFile) bool {
+		return f.Path == key && f.MessageID != messageID
+	}), nil
 }
 
-// LegacyFiles devuelve los archivos de la cuenta cuyo contenido sigue en la
-// base de datos, para poder pasarlos al bucket.
-func (s *Store) LegacyFiles(ctx context.Context, owner string) ([]int64, error) {
-	rows, err := s.pool.Query(ctx,
-		`SELECT id FROM saved_files WHERE owner = $1 AND object_key = '' AND content IS NOT NULL`, owner)
+// Folders devuelve las carpetas que el usuario creó a mano.
+func (s *Store) Folders(ctx context.Context, account string) ([]string, error) {
+	doc, err := s.view(ctx, account)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-
-	var ids []int64
-	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		ids = append(ids, id)
+	folders := slices.Clone(doc.Folders)
+	if folders == nil {
+		folders = []string{}
 	}
-	return ids, rows.Err()
+	slices.Sort(folders)
+	return folders, nil
 }
 
-// MoveToBucket anota que el contenido de un archivo ya está en el bucket y
-// lo quita de la base de datos.
-func (s *Store) MoveToBucket(ctx context.Context, owner string, id int64, key string) error {
-	_, err := s.pool.Exec(ctx,
-		`UPDATE saved_files SET object_key = $3, content = NULL WHERE owner = $1 AND id = $2`, owner, id, key)
-	return err
+// AddFolder registra una carpeta creada por el usuario.
+func (s *Store) AddFolder(ctx context.Context, account, folder string) error {
+	return s.update(ctx, account, func(doc *document) error {
+		if !slices.Contains(doc.Folders, folder) {
+			doc.Folders = append(doc.Folders, folder)
+		}
+		return nil
+	})
 }
 
-// InvoiceOfMessage devuelve la fecha y el emisor de la factura que llegó en
-// un correo. ok es false si ese correo no trajo ninguna factura conocida.
-func (s *Store) InvoiceOfMessage(ctx context.Context, owner, messageID string) (fecha, emisor string, ok bool) {
-	err := s.pool.QueryRow(ctx, `
-		SELECT fecha, emisor_nombre FROM invoices
-		WHERE owner = $1 AND message_id = $2 ORDER BY id LIMIT 1`, owner, messageID).Scan(&fecha, &emisor)
-	return fecha, emisor, err == nil
+// ErrNotEmpty indica que la carpeta todavía tiene archivos o carpetas dentro.
+var ErrNotEmpty = errors.New("folder not empty")
+
+// RemoveFolder borra una carpeta creada por el usuario, solo si está vacía.
+// `prefix` es la ruta completa de la carpeta en el bucket (cuenta/carpeta).
+func (s *Store) RemoveFolder(ctx context.Context, account, folder, prefix string) error {
+	return s.update(ctx, account, func(doc *document) error {
+		if slices.ContainsFunc(doc.Files, func(f SavedFile) bool { return strings.HasPrefix(f.Path, prefix+"/") }) ||
+			slices.ContainsFunc(doc.Folders, func(other string) bool { return strings.HasPrefix(other, folder+"/") }) {
+			return ErrNotEmpty
+		}
+		i := slices.Index(doc.Folders, folder)
+		if i < 0 {
+			return ErrNotFound
+		}
+		doc.Folders = slices.Delete(doc.Folders, i, i+1)
+		return nil
+	})
+}
+
+// MoveFile anota la nueva ruta de un archivo que ya se movió en el bucket.
+func (s *Store) MoveFile(ctx context.Context, account string, id int64, path string) (SavedFile, error) {
+	var moved SavedFile
+	err := s.update(ctx, account, func(doc *document) error {
+		i := slices.IndexFunc(doc.Files, func(f SavedFile) bool { return f.ID == id })
+		if i < 0 {
+			return ErrNotFound
+		}
+		doc.Files[i].Path = path
+		moved = doc.Files[i]
+		return nil
+	})
+	return moved, err
+}
+
+// PathTaken dice si otro archivo (distinto de `id`) ya ocupa esa ruta.
+func (s *Store) PathTaken(ctx context.Context, account, path string, id int64) (bool, error) {
+	doc, err := s.view(ctx, account)
+	if err != nil {
+		return false, err
+	}
+	return slices.ContainsFunc(doc.Files, func(f SavedFile) bool { return f.Path == path && f.ID != id }), nil
 }
