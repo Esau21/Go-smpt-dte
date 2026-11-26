@@ -36,10 +36,18 @@ func Open(ctx context.Context, name string) (*Bucket, error) {
 	handle := client.Bucket(name)
 
 	if os.Getenv("STORAGE_EMULATOR_HOST") != "" {
-		if _, err := handle.Attrs(ctx); errors.Is(err, storage.ErrBucketNotExist) {
-			if err := handle.Create(ctx, "local", nil); err != nil {
-				return nil, err
-			}
+		// Con límite de tiempo: si el emulador no responde (por ejemplo, al
+		// correr la API fuera de Docker) la librería reintentaría sin fin y
+		// la API nunca terminaría de arrancar.
+		ctx, cancel := context.WithTimeout(ctx, 6*time.Second)
+		defer cancel()
+
+		_, err := handle.Attrs(ctx)
+		if errors.Is(err, storage.ErrBucketNotExist) {
+			err = handle.Create(ctx, "local", nil)
+		}
+		if err != nil {
+			return nil, err
 		}
 	}
 	return &Bucket{name: name, handle: handle}, nil

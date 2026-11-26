@@ -124,10 +124,15 @@ func Open(ctx context.Context, dsn string) (*Store, error) {
 	}
 
 	for attempt := 1; ; attempt++ {
-		if _, err = pool.Exec(ctx, schema+filesSchema); err == nil {
+		// Cada intento tiene su propio límite, para no quedarse esperando
+		// a un servidor que no existe.
+		tryCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
+		_, err = pool.Exec(tryCtx, schema+filesSchema)
+		cancel()
+		if err == nil {
 			return &Store{pool: pool}, nil
 		}
-		if attempt == 15 {
+		if attempt == 6 {
 			pool.Close()
 			return nil, fmt.Errorf("database not ready: %w", err)
 		}
