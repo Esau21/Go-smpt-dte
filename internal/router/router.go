@@ -4,6 +4,7 @@ import (
 	"log"
 	"strings"
 
+	"github.com/Esau21/Go-smpt-dte/internal/invoices"
 	"github.com/Esau21/Go-smpt-dte/internal/mail"
 	"github.com/Esau21/Go-smpt-dte/internal/validations"
 	"github.com/gin-gonic/gin"
@@ -12,6 +13,8 @@ import (
 type Routes struct {
 	Routes *gin.Engine
 	Mail   mail.IMail
+	// Invoices son las facturas guardadas en la base de datos.
+	Invoices *invoices.Handlers
 }
 
 func (r *Routes) SetupRouter() *gin.Engine {
@@ -21,6 +24,7 @@ func (r *Routes) SetupRouter() *gin.Engine {
 
 	r.HealthCheckRoutes()
 	r.MailRoutes(r.Routes)
+	r.InvoiceRoutes(r.Routes)
 
 	return r.Routes
 }

@@ -20,6 +20,7 @@ func (ro *Routes) MailRoutes(r *gin.Engine) {
 		routes.GET("/messages", ro.Mail.WithSession(ro.Mail.ListMessages))
 		routes.GET("/messages/:id", ro.Mail.WithSession(ro.Mail.GetMessage))
 		routes.GET("/messages/:id/dte", ro.Mail.WithSession(ro.Mail.GetDTE))
+		routes.GET("/messages/:id/attachments/:index", ro.Mail.WithSession(ro.Mail.GetAttachment))
 	}
 
 }
