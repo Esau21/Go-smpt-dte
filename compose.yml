@@ -4,7 +4,7 @@ services:
     image: postgres:17
     container_name: postgres-db
     ports:
-      - 5435:5434 
+      - 5435:5432 
     restart: always
     environment:
       - POSTGRES_DB=${DB_NAME} 
@@ -31,15 +31,37 @@ services:
       - PUBLIC_ORIGIN=${PUBLIC_ORIGIN}
       - AFTER_LOGIN_PATH=${AFTER_LOGIN_PATH}
       - MAIL_PROVIDER=${MAIL_PROVIDER}
+      # Bucket donde se guardan los archivos "en la nube"
+      - FILES_BUCKET=${FILES_BUCKET:-bookeep-archivos}
+      # En local el bucket es un emulador. En producción, deja esta variable
+      # vacía en el .env (STORAGE_EMULATOR_HOST=) y da credenciales de Google.
+      - STORAGE_EMULATOR_HOST=${STORAGE_EMULATOR_HOST-gcs:4443}
+    depends_on:
+      - postgres
+      - gcs
     restart: always
     ports:
       - 8080:8080
     networks:
       - api-postgres
   
+  # Emulador local de Google Cloud Storage (solo para desarrollo)
+  gcs:
+    image: fsouza/fake-gcs-server:1.52.2
+    container_name: gcs-local
+    command: -scheme http -port 4443 -external-url http://gcs:4443 -public-host gcs:4443
+    ports:
+      - 4443:4443
+    restart: always
+    networks:
+      - api-postgres
+    volumes:
+      - gcs_local_data:/storage
+
 networks:
   api-postgres:
     driver: bridge
 
 volumes:
   postgres_local_data: {}
+  gcs_local_data: {}
