@@ -1,0 +1,54 @@
+name: Deploy Cloud Run Service Development
+on: 
+  push:
+    branches:
+      - develop
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    environment: development
+    steps:
+      - name: code checkout
+        uses: actions/checkout@v2
+
+      - id: 'auth'
+        name: 'Authenticate to Google Cloud'
+        uses: 'google-github-actions/auth@v1'
+        with:
+          create_credentials_file: true
+          workload_identity_provider: ${{ secrets.WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.SERVICE_ACCOUNT }}
+
+      - name: 'Set up Cloud SDK'
+        uses: 'google-github-actions/setup-gcloud@v2'
+        with:
+          version: '>= 363.0.0'
+
+      - name: 'Build Image'
+        env:
+          DOCKER_BUILDKIT: 1
+        run: |
+          gcloud auth configure-docker us-east4-docker.pkg.dev
+          docker pull ${{ secrets.CLOUD_REGISTRY }}:latest || true
+
+          docker build \
+            --build-arg BUILDKIT_INLINE_CACHE=1 \
+            --cache-from ${{ secrets.CLOUD_REGISTRY }}:latest \
+            -t ${{ secrets.CLOUD_REGISTRY }}:${{ github.sha }} \
+            -t ${{ secrets.CLOUD_REGISTRY }}:latest .
+        
+      - name: 'Push Image'
+        run: |
+          docker push ${{ secrets.CLOUD_REGISTRY }}:${{ github.sha }}
+          docker push ${{ secrets.CLOUD_REGISTRY }}:latest
+      
+      - name: 'Deploy Image'
+        run: |
+          gcloud run deploy ${{ secrets.SERVICE_NAME }} \
+            --image ${{ secrets.CLOUD_REGISTRY }}:${{ github.sha }} \
+            --region us-east4 \
+            --port ${{ secrets.PORT }} \
+            --service-account=${{ secrets.SERVICE_ACCOUNT }} 
